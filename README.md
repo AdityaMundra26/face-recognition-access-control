@@ -29,6 +29,16 @@ venv\Scripts\activate           # Windows
 pip install -r requirements.txt
 ```
 
+## Running the app
+
+```bash
+streamlit run src/app/main.py
+```
+
+Opens a browser UI with two tabs: **Enroll** (name + photo -> stored in the
+vector store) and **Check access** (photo -> recognized name/similarity per
+face, or "unknown").
+
 ## Notes
 
 `data/enrolled_faces/` is excluded from version control because it contains
