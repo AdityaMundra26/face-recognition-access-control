@@ -26,7 +26,7 @@ from src.ingestion import (  # noqa: E402  (needs sys.path set first)
     detect_single_face,
     generate_embedding,
 )
-from src.recognition import FaceRecognizer, RecognitionResult  # noqa: E402
+from src.recognition import FaceRecognizer, RecognitionResult, eye_openness, is_blink  # noqa: E402
 from src.vector_store import FaceVectorStore  # noqa: E402
 
 GRANTED_BGR = (0, 200, 0)
@@ -56,6 +56,11 @@ def photo_input(key_prefix: str):
         "...or upload a photo", type=["jpg", "jpeg", "png"], key=f"{key_prefix}_upload"
     )
     return camera or upload
+
+
+def _face_area(face) -> float:
+    x1, y1, x2, y2 = face.bbox
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
 def draw_result_box(image: np.ndarray, face, result: RecognitionResult) -> None:
@@ -102,26 +107,45 @@ def render_enroll_tab(store: FaceVectorStore) -> None:
 
 def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit: AuditLog) -> None:
     st.subheader("Check access")
+    st.caption(
+        "A two-shot blink challenge guards against a static photo being held up to "
+        "the camera: take a photo with eyes open, then a second one mid-blink. "
+        "This only proves *something* blinked — it's not a defense against a video "
+        "of the real person being replayed."
+    )
     if store.count() == 0:
         st.info("No one is enrolled yet — add a face on the Enroll tab first.")
 
-    photo = photo_input("access")
-    if photo is not None:
-        image = decode_upload(photo)
-        faces = detect_faces(image)
-        if not faces:
-            st.warning("No face detected.")
+    open_photo = st.camera_input("Step 1: look at the camera, eyes open", key="access_open")
+    blink_photo = st.camera_input("Step 2: now blink", key="access_blink")
+
+    if open_photo is not None and blink_photo is not None:
+        open_faces = detect_faces(decode_upload(open_photo))
+        blink_image = decode_upload(blink_photo)
+        blink_faces = detect_faces(blink_image)
+
+        if not open_faces or not blink_faces:
+            st.warning("Couldn't detect a face in one of the two shots — try again.")
         else:
-            annotated = image.copy()
-            for face, result in recognizer.identify_faces(faces):
-                draw_result_box(annotated, face, result)
+            open_face = max(open_faces, key=_face_area)
+            blink_face = max(blink_faces, key=_face_area)
+            before = eye_openness(open_face.landmark_2d_106)
+            after = eye_openness(blink_face.landmark_2d_106)
+
+            if not is_blink(before, after):
+                st.error("Liveness check failed — no blink detected between the two shots. Try again.")
+                audit.record(name=None, similarity=0.0, granted=False, reason="liveness_failed")
+            else:
+                result = recognizer.identify(generate_embedding(blink_face))
                 audit.record(name=result.name, similarity=result.similarity, granted=result.matched)
+
+                annotated = blink_image.copy()
+                draw_result_box(annotated, blink_face, result)
                 if result.matched:
                     st.success(f"ACCESS GRANTED — {result.name} (similarity {result.similarity:.2f})")
                 else:
                     st.error(f"ACCESS DENIED (best similarity {result.similarity:.2f})")
-
-            st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+                st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
 
     st.divider()
     st.write("**Recent access attempts**")
@@ -136,6 +160,7 @@ def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit:
                     "name": event.name or "unknown",
                     "similarity": round(event.similarity, 3),
                     "granted": event.granted,
+                    "reason": event.reason or "",
                 }
                 for event in events
             ],

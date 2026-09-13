@@ -23,6 +23,10 @@ class AccessEvent:
     name: str | None
     similarity: float
     granted: bool
+    # None for a normal recognition outcome; e.g. "liveness_failed" when
+    # access was denied before recognition even ran. Optional (and last)
+    # so older log lines without it still parse.
+    reason: str | None = None
 
 
 class AuditLog:
@@ -32,13 +36,21 @@ class AuditLog:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
-    def record(self, *, name: str | None, similarity: float, granted: bool) -> AccessEvent:
+    def record(
+        self,
+        *,
+        name: str | None,
+        similarity: float,
+        granted: bool,
+        reason: str | None = None,
+    ) -> AccessEvent:
         """Append one access event and return it."""
         event = AccessEvent(
             timestamp=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             name=name,
             similarity=similarity,
             granted=granted,
+            reason=reason,
         )
         with self._path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(event)) + "\n")

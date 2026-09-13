@@ -40,10 +40,12 @@ streamlit run src/app/main.py
 ```
 
 Opens a browser UI with two tabs: **Enroll** (name + photo -> stored in the
-vector store) and **Check access** (photo -> recognized name/similarity per
-face, or "unknown"). Without `APP_PASSWORD` set (or an `app_password` entry
-in `.streamlit/secrets.toml`), the app runs without login protection and
-shows a warning — anyone who can open it can enroll or remove faces.
+vector store) and **Check access** (a two-shot blink challenge — eyes open,
+then blink — followed by recognized name/similarity, or "unknown"; a static
+photo held up to the camera fails the blink check). Without `APP_PASSWORD`
+set (or an `app_password` entry in `.streamlit/secrets.toml`), the app runs
+without login protection and shows a warning — anyone who can open it can
+enroll or remove faces.
 
 ## Notes
 
