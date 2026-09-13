@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.app.audit_log import AuditLog  # noqa: E402
 from src.ingestion import (  # noqa: E402  (needs sys.path set first)
     FaceEnrollmentError,
     detect_faces,
@@ -34,6 +35,11 @@ DENIED_BGR = (0, 0, 220)
 @st.cache_resource
 def get_store() -> FaceVectorStore:
     return FaceVectorStore()
+
+
+@st.cache_resource
+def get_audit_log() -> AuditLog:
+    return AuditLog()
 
 
 def decode_upload(uploaded) -> np.ndarray:
@@ -93,30 +99,47 @@ def render_enroll_tab(store: FaceVectorStore) -> None:
             st.rerun()
 
 
-def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer) -> None:
+def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit: AuditLog) -> None:
     st.subheader("Check access")
     if store.count() == 0:
         st.info("No one is enrolled yet — add a face on the Enroll tab first.")
 
     photo = photo_input("access")
-    if photo is None:
-        return
-
-    image = decode_upload(photo)
-    faces = detect_faces(image)
-    if not faces:
-        st.warning("No face detected.")
-        return
-
-    annotated = image.copy()
-    for face, result in recognizer.identify_faces(faces):
-        draw_result_box(annotated, face, result)
-        if result.matched:
-            st.success(f"ACCESS GRANTED — {result.name} (similarity {result.similarity:.2f})")
+    if photo is not None:
+        image = decode_upload(photo)
+        faces = detect_faces(image)
+        if not faces:
+            st.warning("No face detected.")
         else:
-            st.error(f"ACCESS DENIED (best similarity {result.similarity:.2f})")
+            annotated = image.copy()
+            for face, result in recognizer.identify_faces(faces):
+                draw_result_box(annotated, face, result)
+                audit.record(name=result.name, similarity=result.similarity, granted=result.matched)
+                if result.matched:
+                    st.success(f"ACCESS GRANTED — {result.name} (similarity {result.similarity:.2f})")
+                else:
+                    st.error(f"ACCESS DENIED (best similarity {result.similarity:.2f})")
 
-    st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+            st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+
+    st.divider()
+    st.write("**Recent access attempts**")
+    events = audit.recent(limit=20)
+    if not events:
+        st.caption("No access attempts logged yet.")
+    else:
+        st.dataframe(
+            [
+                {
+                    "time": event.timestamp,
+                    "name": event.name or "unknown",
+                    "similarity": round(event.similarity, 3),
+                    "granted": event.granted,
+                }
+                for event in events
+            ],
+            use_container_width=True,
+        )
 
 
 def main() -> None:
@@ -125,12 +148,13 @@ def main() -> None:
 
     store = get_store()
     recognizer = FaceRecognizer(store)
+    audit = get_audit_log()
 
     enroll_tab, access_tab = st.tabs(["Enroll", "Check access"])
     with enroll_tab:
         render_enroll_tab(store)
     with access_tab:
-        render_access_tab(store, recognizer)
+        render_access_tab(store, recognizer, audit)
 
 
 main()
