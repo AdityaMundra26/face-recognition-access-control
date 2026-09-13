@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.app.audit_log import AuditLog  # noqa: E402
+from src.app.auth import require_login  # noqa: E402
 from src.ingestion import (  # noqa: E402  (needs sys.path set first)
     FaceEnrollmentError,
     detect_faces,
@@ -144,6 +145,14 @@ def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit:
 
 def main() -> None:
     st.set_page_config(page_title="Face Recognition Access Control", page_icon="🔐")
+    if not require_login():
+        return
+
+    if st.session_state.get("authenticated"):
+        st.sidebar.button(
+            "Log out", on_click=lambda: st.session_state.update(authenticated=False)
+        )
+
     st.title("Face Recognition Access Control")
 
     store = get_store()
