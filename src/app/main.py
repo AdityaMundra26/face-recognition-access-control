@@ -18,8 +18,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.app.actuator import grant_access  # noqa: E402
 from src.app.audit_log import AuditLog  # noqa: E402
-from src.app.auth import require_login  # noqa: E402
+from src.app.auth import log_out, render_account_management, require_login  # noqa: E402
+from src.app.lockout import WINDOW, check_lockout  # noqa: E402
+from src.app.users import UserStore  # noqa: E402
 from src.ingestion import (  # noqa: E402  (needs sys.path set first)
     FaceEnrollmentError,
     detect_faces,
@@ -43,19 +46,38 @@ def get_audit_log() -> AuditLog:
     return AuditLog()
 
 
-def decode_upload(uploaded) -> np.ndarray:
-    """Decode a Streamlit camera/file upload to a BGR image."""
+@st.cache_resource
+def get_user_store() -> UserStore:
+    return UserStore()
+
+
+def decode_upload(uploaded, *, mirror: bool = False) -> np.ndarray:
+    """Decode a Streamlit camera/file upload to a BGR image.
+
+    ``st.camera_input``'s live preview is mirrored (like a normal selfie
+    camera), but the captured frame it hands back is the raw, unmirrored
+    sensor image -- so without flipping it back, the photo looks reversed
+    from what was framed. Pass ``mirror=True`` for camera shots; leave it
+    False for file uploads, which were never mirrored to begin with.
+    """
     data = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    return cv2.flip(image, 1) if mirror else image
 
 
-def photo_input(key_prefix: str):
-    """A camera shot or file upload, whichever the user provided."""
+def photo_input(key_prefix: str) -> tuple[object, bool]:
+    """A camera shot or file upload, whichever the user provided.
+
+    Returns ``(file, is_camera_shot)`` so the caller knows whether to
+    mirror it when decoding.
+    """
     camera = st.camera_input("Take a photo", key=f"{key_prefix}_camera")
+    if camera is not None:
+        return camera, True
     upload = st.file_uploader(
         "...or upload a photo", type=["jpg", "jpeg", "png"], key=f"{key_prefix}_upload"
     )
-    return camera or upload
+    return upload, False
 
 
 def _face_area(face) -> float:
@@ -81,10 +103,10 @@ def draw_result_box(image: np.ndarray, face, result: RecognitionResult) -> None:
 def render_enroll_tab(store: FaceVectorStore) -> None:
     st.subheader("Enroll a face")
     name = st.text_input("Name")
-    photo = photo_input("enroll")
+    photo, is_camera_shot = photo_input("enroll")
 
     if st.button("Enroll", disabled=not (name and photo)):
-        image = decode_upload(photo)
+        image = decode_upload(photo, mirror=is_camera_shot)
         try:
             face = detect_single_face(image)
         except FaceEnrollmentError as exc:
@@ -105,49 +127,7 @@ def render_enroll_tab(store: FaceVectorStore) -> None:
             st.rerun()
 
 
-def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit: AuditLog) -> None:
-    st.subheader("Check access")
-    st.caption(
-        "A two-shot blink challenge guards against a static photo being held up to "
-        "the camera: take a photo with eyes open, then a second one mid-blink. "
-        "This only proves *something* blinked — it's not a defense against a video "
-        "of the real person being replayed."
-    )
-    if store.count() == 0:
-        st.info("No one is enrolled yet — add a face on the Enroll tab first.")
-
-    open_photo = st.camera_input("Step 1: look at the camera, eyes open", key="access_open")
-    blink_photo = st.camera_input("Step 2: now blink", key="access_blink")
-
-    if open_photo is not None and blink_photo is not None:
-        open_faces = detect_faces(decode_upload(open_photo))
-        blink_image = decode_upload(blink_photo)
-        blink_faces = detect_faces(blink_image)
-
-        if not open_faces or not blink_faces:
-            st.warning("Couldn't detect a face in one of the two shots — try again.")
-        else:
-            open_face = max(open_faces, key=_face_area)
-            blink_face = max(blink_faces, key=_face_area)
-            before = eye_openness(open_face.landmark_2d_106)
-            after = eye_openness(blink_face.landmark_2d_106)
-
-            if not is_blink(before, after):
-                st.error("Liveness check failed — no blink detected between the two shots. Try again.")
-                audit.record(name=None, similarity=0.0, granted=False, reason="liveness_failed")
-            else:
-                result = recognizer.identify(generate_embedding(blink_face))
-                audit.record(name=result.name, similarity=result.similarity, granted=result.matched)
-
-                annotated = blink_image.copy()
-                draw_result_box(annotated, blink_face, result)
-                if result.matched:
-                    st.success(f"ACCESS GRANTED — {result.name} (similarity {result.similarity:.2f})")
-                else:
-                    st.error(f"ACCESS DENIED (best similarity {result.similarity:.2f})")
-                st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
-
-    st.divider()
+def _render_recent_attempts(audit: AuditLog) -> None:
     st.write("**Recent access attempts**")
     events = audit.recent(limit=20)
     if not events:
@@ -168,15 +148,76 @@ def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit:
         )
 
 
-def main() -> None:
-    st.set_page_config(page_title="Face Recognition Access Control", page_icon="🔐")
-    if not require_login():
+def render_access_tab(store: FaceVectorStore, recognizer: FaceRecognizer, audit: AuditLog) -> None:
+    st.subheader("Check access")
+    st.caption(
+        "A two-shot blink challenge guards against a static photo being held up to "
+        "the camera: take a photo with eyes open, then a second one mid-blink. "
+        "This only proves *something* blinked — it's not a defense against a video "
+        "of the real person being replayed."
+    )
+    if store.count() == 0:
+        st.info("No one is enrolled yet — add a face on the Enroll tab first.")
+
+    lockout = check_lockout(audit)
+    if lockout.locked:
+        window_minutes = int(WINDOW.total_seconds() // 60)
+        retry_at = lockout.retry_after.strftime("%H:%M:%S UTC") if lockout.retry_after else "shortly"
+        st.error(
+            f"Too many failed attempts ({lockout.recent_failures} in the last "
+            f"{window_minutes} minutes). Locked out until {retry_at}."
+        )
+        st.divider()
+        _render_recent_attempts(audit)
         return
 
-    if st.session_state.get("authenticated"):
-        st.sidebar.button(
-            "Log out", on_click=lambda: st.session_state.update(authenticated=False)
-        )
+    open_photo = st.camera_input("Step 1: look at the camera, eyes open", key="access_open")
+    blink_photo = st.camera_input("Step 2: now blink", key="access_blink")
+
+    if open_photo is not None and blink_photo is not None:
+        open_faces = detect_faces(decode_upload(open_photo, mirror=True))
+        blink_image = decode_upload(blink_photo, mirror=True)
+        blink_faces = detect_faces(blink_image)
+
+        if not open_faces or not blink_faces:
+            st.warning("Couldn't detect a face in one of the two shots — try again.")
+        else:
+            open_face = max(open_faces, key=_face_area)
+            blink_face = max(blink_faces, key=_face_area)
+            before = eye_openness(open_face.landmark_2d_106)
+            after = eye_openness(blink_face.landmark_2d_106)
+
+            if not is_blink(before, after):
+                st.error("Liveness check failed — no blink detected between the two shots. Try again.")
+                audit.record(name=None, similarity=0.0, granted=False, reason="liveness_failed")
+            else:
+                result = recognizer.identify(generate_embedding(blink_face))
+                audit.record(name=result.name, similarity=result.similarity, granted=result.matched)
+
+                annotated = blink_image.copy()
+                draw_result_box(annotated, blink_face, result)
+                if result.matched:
+                    grant_access(result.name)
+                    st.success(f"ACCESS GRANTED — {result.name} (similarity {result.similarity:.2f})")
+                else:
+                    st.error(f"ACCESS DENIED (best similarity {result.similarity:.2f})")
+                st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+
+    st.divider()
+    _render_recent_attempts(audit)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Face Recognition Access Control", page_icon="🔐")
+    users = get_user_store()
+    if not require_login(users):
+        return
+
+    current_user = st.session_state.get("authenticated_user")
+    if current_user:
+        st.sidebar.write(f"Logged in as **{current_user}**")
+    st.sidebar.button("Log out", on_click=log_out)
+    render_account_management(users)
 
     st.title("Face Recognition Access Control")
 

@@ -7,17 +7,22 @@ anyone enrolled?".
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 
 from src.vector_store import FaceVectorStore
 
+THRESHOLD_ENV_VAR = "RECOGNITION_THRESHOLD"
+
 # Cosine similarity threshold above which the best match counts as a
 # recognized person. ArcFace (buffalo_l) embeddings: genuine (same-person)
 # pairs typically score well above 0.5 and impostor pairs well below, so 0.5
-# leaves a margin against false accepts. Tune per deployment/camera.
-DEFAULT_THRESHOLD = 0.5
+# is a reasonable starting point without any real false-accept/false-reject
+# data to tune against. Override with the RECOGNITION_THRESHOLD env var once
+# you have enough real usage to tell whether it's too strict or too loose.
+DEFAULT_THRESHOLD = float(os.environ.get(THRESHOLD_ENV_VAR, "0.5"))
 
 
 @dataclass(frozen=True)

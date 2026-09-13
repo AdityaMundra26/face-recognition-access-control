@@ -15,6 +15,10 @@ from pathlib import Path
 DEFAULT_LOG_PATH = Path("data/enrolled_faces/access_log.jsonl")
 
 
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
 @dataclass(frozen=True)
 class AccessEvent:
     """One recorded access-check attempt."""
@@ -46,7 +50,7 @@ class AuditLog:
     ) -> AccessEvent:
         """Append one access event and return it."""
         event = AccessEvent(
-            timestamp=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            timestamp=_utcnow().isoformat(timespec="seconds"),
             name=name,
             similarity=similarity,
             granted=granted,
