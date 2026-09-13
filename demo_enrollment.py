@@ -13,7 +13,10 @@ Usage:
     # images (one single-face enrollment + one multiple-faces error case)
     python demo_enrollment.py
 
-For each image it prints the embedding shape, dtype and L2 norm.
+For each image it prints the embedding shape, dtype and L2 norm. Explicit or
+data/samples/ targets are also persisted into the real vector store
+(data/enrolled_faces/vector_store/); the bundled fallback demo is not, since
+it's a self-contained smoke test rather than real enrollment.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from src.ingestion import FaceEnrollmentError, enroll_face
+from src.vector_store import FaceVectorStore
 
 SAMPLE_DIR = Path("data/samples")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -49,8 +53,12 @@ def user_targets(args: list[str]) -> list[tuple[str, Path]]:
     return []
 
 
-def enroll_and_report(name: str, path: Path) -> bool:
-    """Enroll one image and print the result. Returns True on a stored embedding."""
+def enroll_and_report(name: str, path: Path, store: FaceVectorStore | None = None) -> bool:
+    """Enroll one image and print the result.
+
+    If ``store`` is given, the embedding is also persisted there. Returns
+    True if the image produced an embedding.
+    """
     try:
         enrolled_name, embedding = enroll_face(name, path)
     except (FaceEnrollmentError, FileNotFoundError, ValueError) as exc:
@@ -63,6 +71,9 @@ def enroll_and_report(name: str, path: Path) -> bool:
         f"L2-norm={np.linalg.norm(embedding):.4f}\n"
         f"       first 5 values: {np.round(embedding[:5], 4)}"
     )
+    if store is not None:
+        store.add(enrolled_name, embedding)
+        print(f"       stored in vector store (now {store.count()} embedding(s))")
     return True
 
 
@@ -97,8 +108,12 @@ def main(argv: list[str]) -> int:
     if not targets:
         return run_bundled_demo()
 
-    failures = sum(not enroll_and_report(name, path) for name, path in targets)
-    print(f"\nEnrolled {len(targets) - failures}/{len(targets)} image(s).")
+    store = FaceVectorStore()
+    failures = sum(not enroll_and_report(name, path, store) for name, path in targets)
+    print(
+        f"\nEnrolled {len(targets) - failures}/{len(targets)} image(s) "
+        f"(vector store now has {store.count()} total)."
+    )
     return 1 if failures else 0
 
 

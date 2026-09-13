@@ -1,16 +1,15 @@
-"""Real-time visual test of the InsightFace detection pipeline.
+"""Real-time visual test of the InsightFace detection + recognition pipeline.
 
-Opens the webcam, runs InsightFace's FaceAnalysis on every frame, draws a box
-around each detected face, and overlays the live face count.
+Opens the webcam, runs InsightFace's FaceAnalysis on every frame, and draws a
+box around each detected face labeled with its recognized name (looked up in
+the persistent vector store) or "unknown".
 
 Keys (focus the video window):
-    s   save the current frame + embedding as a named enrollment
-        (you'll be prompted for a name in the terminal)
+    s   enroll the largest face in the current frame: prompts for a name in
+        the terminal, then adds its embedding to the vector store
+        (data/enrolled_faces/vector_store/) and archives the frame to
+        data/enrolled_faces/test_samples/.
     q   quit
-
-Saved enrollments go to data/enrolled_faces/test_samples/ as a matching pair:
-    <name>_<timestamp>.jpg   the captured frame
-    <name>_<timestamp>.npy   the 512-d float32 embedding
 
 Run from the repo root:  python scripts/live_face_test.py [--camera N]
 """
@@ -35,9 +34,11 @@ from src.ingestion.enrollment import (  # noqa: E402  (needs sys.path set first)
     generate_embedding,
     get_face_app,
 )
+from src.recognition import FaceRecognizer, RecognitionResult  # noqa: E402
+from src.vector_store import FaceVectorStore  # noqa: E402
 
-SAVE_DIR = REPO_ROOT / "data" / "enrolled_faces" / "test_samples"
-WINDOW = "live face test  (s = save enrollment, q = quit)"
+ARCHIVE_DIR = REPO_ROOT / "data" / "enrolled_faces" / "test_samples"
+WINDOW = "live face test  (s = enroll, q = quit)"
 
 GREEN = (0, 255, 0)
 YELLOW = (0, 215, 255)
@@ -49,25 +50,32 @@ def _face_area(face) -> float:
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
-def draw_overlay(frame: np.ndarray, faces: list) -> np.ndarray:
-    """Draw a box per face plus the live count. Returns the annotated frame."""
+def draw_overlay(
+    frame: np.ndarray, pairs: list[tuple[object, RecognitionResult]]
+) -> np.ndarray:
+    """Draw a labeled box per (face, RecognitionResult) plus the live count."""
     annotated = frame.copy()
-    for face in faces:
+    for face, result in pairs:
         x1, y1, x2, y2 = face.bbox.astype(int)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), GREEN, 2)
-        score = float(getattr(face, "det_score", 0.0) or 0.0)
+        color = GREEN if result.matched else YELLOW
+        label = (
+            f"{result.name} {result.similarity:.2f}"
+            if result.matched
+            else f"unknown {result.similarity:.2f}"
+        )
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
-            annotated, f"{score:.2f}", (x1, max(0, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 1, cv2.LINE_AA,
+            annotated, label, (x1, max(0, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
         )
 
-    count_color = GREEN if len(faces) == 1 else YELLOW if faces else RED
+    count_color = GREEN if len(pairs) == 1 else YELLOW if pairs else RED
     cv2.putText(
-        annotated, f"Faces: {len(faces)}", (12, 30),
+        annotated, f"Faces: {len(pairs)}", (12, 30),
         cv2.FONT_HERSHEY_SIMPLEX, 0.9, count_color, 2, cv2.LINE_AA,
     )
     cv2.putText(
-        annotated, "s = save   q = quit", (12, annotated.shape[0] - 15),
+        annotated, "s = enroll   q = quit", (12, annotated.shape[0] - 15),
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
     )
     return annotated
@@ -78,13 +86,13 @@ def _slugify(name: str) -> str:
     return slug or "unnamed"
 
 
-def save_enrollment(frame: np.ndarray, faces: list) -> None:
-    """Prompt for a name and save the frame + one embedding to SAVE_DIR."""
+def enroll_from_frame(frame: np.ndarray, faces: list, store: FaceVectorStore) -> None:
+    """Prompt for a name and add the largest face's embedding to ``store``."""
     if not faces:
-        print("  no face in frame - nothing saved")
+        print("  no face in frame - nothing enrolled")
         return
     if len(faces) > 1:
-        print(f"  {len(faces)} faces in frame - saving the largest one")
+        print(f"  {len(faces)} faces in frame - enrolling the largest one")
     face = max(faces, key=_face_area)
 
     try:
@@ -95,15 +103,16 @@ def save_enrollment(frame: np.ndarray, faces: list) -> None:
 
     name = input("  enrollment name: ").strip()
     if not name:
-        print("  empty name - nothing saved")
+        print("  empty name - nothing enrolled")
         return
 
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    store.add(name, embedding)
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = SAVE_DIR / f"{_slugify(name)}_{stamp}"
-    cv2.imwrite(str(base.with_suffix(".jpg")), frame)
-    np.save(base.with_suffix(".npy"), embedding)
-    print(f"  saved {base.name}.jpg + .npy  (embedding {embedding.shape})")
+    image_path = ARCHIVE_DIR / f"{_slugify(name)}_{stamp}.jpg"
+    cv2.imwrite(str(image_path), frame)
+    print(f"  enrolled '{name}' in the vector store; archived frame to {image_path.name}")
 
 
 def main(argv: list[str]) -> int:
@@ -117,6 +126,9 @@ def main(argv: list[str]) -> int:
 
     print("loading InsightFace models (first run downloads the buffalo_l pack)...")
     app = get_face_app(det_size=(args.det_size, args.det_size))
+    store = FaceVectorStore()
+    recognizer = FaceRecognizer(store)
+    print(f"vector store has {store.count()} enrolled embedding(s): {store.list_names()}")
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -124,7 +136,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    print("webcam open - focus the video window; 's' to save, 'q' to quit")
+    print("webcam open - focus the video window; 's' to enroll, 'q' to quit")
 
     try:
         while True:
@@ -134,13 +146,14 @@ def main(argv: list[str]) -> int:
                 return 1
 
             faces = app.get(frame)
-            cv2.imshow(WINDOW, draw_overlay(frame, faces))
+            pairs = recognizer.identify_faces(faces)
+            cv2.imshow(WINDOW, draw_overlay(frame, pairs))
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("s"):
-                save_enrollment(frame, faces)
+                enroll_from_frame(frame, faces, store)
 
             # window closed via the title-bar X
             if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
